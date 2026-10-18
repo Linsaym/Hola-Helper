@@ -1,0 +1,4 @@
+/target
+/.venv
+/models/kws/
+/models/openwakeword/*.onnx

@@ -1,0 +1,11 @@
+[package]
+name = "hola-helper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+ctrlc = "3.5"
+hound = "3.5.1"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Media_Multimedia", "Win32_Security_Cryptography"] }
