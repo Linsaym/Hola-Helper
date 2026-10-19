@@ -8,6 +8,10 @@
     {
       "phrase": "работаем",
       "action": "vscode"
+    },
+    {
+      "phrase": "напомни команды",
+      "action": "commands"
     }
   ]
 }

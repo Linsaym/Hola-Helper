@@ -211,6 +211,8 @@ pub fn run(recognizer: CommandRecognizer) -> Result<(), Box<dyn Error>> {
                             if let Err(error) = result {
                                 eprintln!("[actions] {error}");
                                 crate::voice::failure_or_warn(&stopping);
+                            } else {
+                                crate::voice::success_or_warn(&command.action, &stopping);
                             }
                         } else {
                             if recognition.ambiguous {
