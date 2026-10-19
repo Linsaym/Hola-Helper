@@ -19,6 +19,12 @@ pub fn reply_or_warn(stopping: &AtomicBool) {
     }
 }
 
+pub fn failure_or_warn(stopping: &AtomicBool) {
+    if let Err(error) = play_random(Path::new("assets/voice/fail"), stopping) {
+        eprintln!("[voice] Cannot play failure response: {error}");
+    }
+}
+
 fn wav_files(directory: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -141,5 +147,16 @@ mod tests {
             let _: Vec<i32> = wav.samples().collect::<Result<_, _>>()?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn missing_response_directory_returns_an_error() {
+        assert!(wav_files(Path::new("assets/voice/nonexistent-directory")).is_err());
+    }
+
+    #[test]
+    #[ignore = "plays a random local failure WAV on the default Windows output device"]
+    fn bundled_failure_response_plays() -> Result<(), Box<dyn Error>> {
+        play_random(Path::new("assets/voice/fail"), &AtomicBool::new(false))
     }
 }

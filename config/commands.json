@@ -1,0 +1,13 @@
+{
+  "max_distance": 6,
+  "commands": [
+    {
+      "phrase": "давай поиграем",
+      "action": "steam"
+    },
+    {
+      "phrase": "работаем",
+      "action": "vscode"
+    }
+  ]
+}

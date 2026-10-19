@@ -14,9 +14,16 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Transcription {
+    NoSpeech,
+    Unrecognized,
+    Text(String),
+}
+
 pub struct SpeechWorker {
     requests: Option<SyncSender<Vec<f32>>>,
-    results: Receiver<Result<String, String>>,
+    results: Receiver<Result<Transcription, String>>,
     stopping: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -76,7 +83,7 @@ impl SpeechWorker {
             .map_err(|e| format!("Cannot submit command audio: {e}").into())
     }
 
-    pub fn try_result(&self) -> Result<Option<Result<String, String>>, Box<dyn Error>> {
+    pub fn try_result(&self) -> Result<Option<Result<Transcription, String>>, Box<dyn Error>> {
         match self.results.try_recv() {
             Ok(result) => Ok(Some(result)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -101,9 +108,9 @@ fn transcribe(
     state: &mut WhisperState,
     audio: &[f32],
     stopping: &AtomicBool,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<Transcription, Box<dyn Error>> {
     if stopping.load(Ordering::Relaxed) || !crate::command_audio::contains_speech(audio) {
-        return Ok(String::new());
+        return Ok(Transcription::NoSpeech);
     }
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some("ru"));
@@ -130,12 +137,17 @@ fn transcribe(
     for segment in state.as_iter() {
         // Reject the entire utterance if any segment is classified as no speech.
         if segment.no_speech_probability() >= 0.6 {
-            return Ok(String::new());
+            return Ok(Transcription::NoSpeech);
         }
         text.push_str(segment.to_str()?);
         text.push(' ');
     }
-    Ok(text.trim().to_owned())
+    let text = text.trim();
+    Ok(if text.is_empty() {
+        Transcription::Unrecognized
+    } else {
+        Transcription::Text(text.to_owned())
+    })
 }
 
 unsafe extern "C" fn abort_when_stopping(data: *mut c_void) -> bool {
@@ -168,17 +180,25 @@ mod tests {
         )?;
         for _ in 0..2 {
             worker.submit(vec![0.0; 2 * crate::command_audio::SAMPLE_RATE])?;
-            let text = worker.results.recv_timeout(Duration::from_secs(60))??;
-            assert!(text.is_empty(), "Unexpected silence transcription: {text}");
+            let result = worker.results.recv_timeout(Duration::from_secs(60))??;
+            assert_eq!(result, Transcription::NoSpeech);
         }
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires Base model and HOLA_TEST_COMMAND_WAV pointing to a 16-kHz mono PCM16 recording of 'Запусти Steam'"]
-    fn recognizes_recorded_steam_command_then_silence() -> Result<(), Box<dyn Error>> {
+    #[ignore = "requires Base model and HOLA_TEST_COMMAND_WAV recording the first configured command in 16-kHz mono PCM16"]
+    fn recognizes_recorded_command_then_silence() -> Result<(), Box<dyn Error>> {
         let path = std::env::var_os("HOLA_TEST_COMMAND_WAV")
-            .ok_or("Set HOLA_TEST_COMMAND_WAV to a recording of 'Запусти Steam'")?;
+            .ok_or("Set HOLA_TEST_COMMAND_WAV to a recording of the first configured command")?;
+        let config = crate::config::CommandConfig::load(Path::new("config/commands.json"))?;
+        let expected_action = config
+            .commands
+            .first()
+            .ok_or("No configured commands")?
+            .action
+            .clone();
+        let recognizer = crate::commands::CommandRecognizer::new(config)?;
         let mut wav = crate::wav::open(Path::new(&path))?;
         let audio: Vec<f32> = wav
             .samples::<i16>()
@@ -189,18 +209,21 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )?;
         worker.submit(audio)?;
-        let text = worker.results.recv_timeout(Duration::from_secs(60))??;
+        let Transcription::Text(text) = worker.results.recv_timeout(Duration::from_secs(60))??
+        else {
+            return Err("The command recording did not produce speech text".into());
+        };
         eprintln!("Test transcription: {text}");
         assert_eq!(
-            crate::commands::recognize(&text),
-            Some(crate::commands::Command::LaunchSteam)
+            recognizer
+                .recognize(&text)
+                .command
+                .map(|c| c.action.as_str()),
+            Some(expected_action.as_str())
         );
         worker.submit(vec![0.0; 2 * crate::command_audio::SAMPLE_RATE])?;
-        let text = worker.results.recv_timeout(Duration::from_secs(60))??;
-        assert!(
-            text.is_empty(),
-            "Previous command leaked into silence: {text}"
-        );
+        let result = worker.results.recv_timeout(Duration::from_secs(60))??;
+        assert_eq!(result, Transcription::NoSpeech);
         Ok(())
     }
 }

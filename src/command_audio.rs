@@ -2,9 +2,8 @@
 use std::time::{Duration, Instant};
 
 pub const SAMPLE_RATE: usize = 16_000;
-const MAX_SAMPLES: usize = 8 * SAMPLE_RATE;
-const WAIT_FOR_SPEECH: Duration = Duration::from_secs(5);
-const MAX_DURATION: Duration = Duration::from_secs(8);
+pub const MAX_DURATION: Duration = Duration::from_secs(3);
+const MAX_SAMPLES: usize = MAX_DURATION.as_secs() as usize * SAMPLE_RATE;
 const END_SILENCE_SAMPLES: usize = SAMPLE_RATE * 8 / 10;
 const MIN_SPEECH_SAMPLES: usize = SAMPLE_RATE / 5;
 const MIN_RMS: f32 = 0.01;
@@ -67,8 +66,6 @@ impl CommandRecording {
     fn is_complete_at(&self, elapsed: Duration) -> bool {
         self.samples.len() >= MAX_SAMPLES
             || elapsed >= MAX_DURATION
-            || (self.speech_samples < MIN_SPEECH_SAMPLES
-                && (elapsed >= WAIT_FOR_SPEECH || self.samples.len() >= 5 * SAMPLE_RATE))
             || (self.speech_samples >= MIN_SPEECH_SAMPLES
                 && self.silence_samples >= END_SILENCE_SAMPLES)
     }
@@ -96,10 +93,10 @@ mod tests {
     fn silence_and_brief_clicks_do_not_trigger_stt() {
         let mut recording = CommandRecording::new();
         recording.push(&[0.3; 160]);
-        assert!(recording.push(&vec![0.0; 5 * SAMPLE_RATE]));
+        assert!(recording.push(&vec![0.0; 3 * SAMPLE_RATE]));
         assert!(recording.into_audio().is_none());
         let recording = CommandRecording::new();
-        assert!(recording.is_complete_at(WAIT_FOR_SPEECH));
+        assert!(recording.is_complete_at(Duration::from_secs(3)));
         assert!(recording.into_audio().is_none());
     }
 
@@ -119,6 +116,16 @@ mod tests {
     fn continuous_audio_is_bounded_even_without_a_pause() {
         let mut recording = CommandRecording::new();
         assert!(recording.push(&vec![0.1; MAX_SAMPLES + 1000]));
-        assert_eq!(recording.into_audio().unwrap().len(), MAX_SAMPLES);
+        assert_eq!(recording.into_audio().unwrap().len(), 3 * SAMPLE_RATE);
+    }
+
+    #[test]
+    fn wall_clock_timeout_is_three_seconds_even_if_audio_stops() {
+        let mut recording = CommandRecording::new();
+        assert!(!recording.is_complete_at(Duration::from_millis(2_999)));
+        assert!(recording.is_complete_at(Duration::from_secs(3)));
+        recording.push(&vec![0.05; SAMPLE_RATE]);
+        assert!(!recording.is_complete_at(Duration::from_millis(2_999)));
+        assert!(recording.is_complete_at(Duration::from_secs(3)));
     }
 }

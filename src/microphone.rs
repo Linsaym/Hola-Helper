@@ -1,8 +1,9 @@
 use crate::{
     DETECTION_THRESHOLD,
-    command_audio::CommandRecording,
+    command_audio::{CommandRecording, MAX_DURATION},
+    commands::CommandRecognizer,
     resample::Resampler,
-    speech::SpeechWorker,
+    speech::{SpeechWorker, Transcription},
     wake_word::{FRAME_SAMPLES, WakeWordDetector},
 };
 use cpal::{
@@ -47,7 +48,7 @@ impl CaptureDiagnostics {
     }
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run(recognizer: CommandRecognizer) -> Result<(), Box<dyn Error>> {
     let stopping = Arc::new(AtomicBool::new(false));
     let signal = Arc::clone(&stopping);
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))
@@ -188,18 +189,43 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             diagnostics.playback_active.store(true, Ordering::SeqCst);
             if !stopping.load(Ordering::Relaxed) {
                 match result {
-                    Ok(text) if !text.is_empty() => {
-                        println!("[speech] Recognized: {text}");
-                        if let Some(command) = crate::commands::recognize(&text) {
-                            if let Err(error) = crate::actions::execute(command) {
+                    Ok(Transcription::Text(text)) => {
+                        println!("[speech] Recognized: {text:?}");
+                        let recognition = recognizer.recognize(&text);
+                        let distance = recognition
+                            .distance
+                            .map_or_else(|| "n/a".to_owned(), |d| d.to_string());
+                        println!(
+                            "[commands] Phrase: {text:?}; selected: {:?}; Levenshtein distance: {distance}",
+                            recognition.command.map(|c| c.action.as_str())
+                        );
+                        if let Some(command) = recognition.command {
+                            if let Err(error) = crate::actions::execute(&command.action) {
                                 eprintln!("[actions] {error}");
+                                crate::voice::failure_or_warn(&stopping);
                             }
                         } else {
-                            println!("[commands] Unknown command; no action taken.");
+                            if recognition.ambiguous {
+                                eprintln!(
+                                    "[commands] Ambiguous command: multiple phrases have the same minimum distance; no action taken."
+                                );
+                            } else {
+                                println!("[commands] Unknown command; no action taken.");
+                            }
+                            crate::voice::failure_or_warn(&stopping);
                         }
                     }
-                    Ok(_) => println!("[speech] No speech recognized; no action taken."),
-                    Err(error) => eprintln!("[speech] Cannot recognize command: {error}"),
+                    Ok(Transcription::NoSpeech) => {
+                        println!("[speech] No speech detected; no action taken.")
+                    }
+                    Ok(Transcription::Unrecognized) => {
+                        println!("[speech] Speech could not be recognized; no action taken.");
+                        crate::voice::failure_or_warn(&stopping);
+                    }
+                    Err(error) => {
+                        eprintln!("[speech] Cannot recognize command: {error}");
+                        crate::voice::failure_or_warn(&stopping);
+                    }
                 }
             }
             reset_capture(
@@ -260,8 +286,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         config.sample_rate,
                     )?;
                     filled = 0;
+                    // Start the deadline only after the reply and stale-audio reset.
                     state = AssistantState::Listening(CommandRecording::new());
-                    println!("Listening for a command (up to 8 seconds)...");
+                    println!(
+                        "Listening for a command (up to {} seconds)...",
+                        MAX_DURATION.as_secs()
+                    );
                     break;
                 }
                 filled = 0;

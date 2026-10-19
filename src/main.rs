@@ -1,6 +1,7 @@
 mod actions;
 mod command_audio;
 mod commands;
+mod config;
 mod microphone;
 mod resample;
 mod speech;
@@ -34,7 +35,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("Usage: hola-helper <--mic | 16-kHz-mono.wav>".into());
     }
     if filename == "--mic" {
-        return microphone::run();
+        let config = config::CommandConfig::load(Path::new("config/commands.json"))?;
+        let recognizer = commands::CommandRecognizer::new(config)?;
+        return microphone::run(recognizer);
     }
     let mut reader = wav::open(Path::new(&filename))?;
     let mut detector = WakeWordDetector::new(Path::new("models/openwakeword"))?;
