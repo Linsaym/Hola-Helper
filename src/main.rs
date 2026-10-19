@@ -1,5 +1,9 @@
+mod actions;
+mod command_audio;
+mod commands;
 mod microphone;
 mod resample;
+mod speech;
 mod voice;
 mod wake_word;
 mod wav;

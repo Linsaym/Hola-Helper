@@ -1,6 +1,8 @@
 use crate::{
     DETECTION_THRESHOLD,
+    command_audio::CommandRecording,
     resample::Resampler,
+    speech::SpeechWorker,
     wake_word::{FRAME_SAMPLES, WakeWordDetector},
 };
 use cpal::{
@@ -13,13 +15,19 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, RecvTimeoutError, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
 };
 
 const PACKET_SAMPLES: usize = 512;
 type Packet = [f32; PACKET_SAMPLES];
+
+enum AssistantState {
+    WakeWord,
+    Listening(CommandRecording),
+    Transcribing,
+}
 
 struct CaptureDiagnostics {
     first_samples: AtomicUsize,
@@ -62,6 +70,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("Microphone reported an invalid channel count or sample rate".into());
     }
     let mut detector = WakeWordDetector::new(Path::new("models/openwakeword"))?;
+    // Load once before capture starts, then keep inference off the audio consumer.
+    let speech = SpeechWorker::new(
+        Path::new("models/whisper/ggml-base.bin"),
+        Arc::clone(&stopping),
+    )?;
     let (sender, receiver) = mpsc::sync_channel::<Packet>(64);
     let (error_sender, errors) = mpsc::sync_channel(1);
     let overflow = Arc::new(AtomicBool::new(false));
@@ -121,6 +134,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let mut last_detection = None;
     let mut first_callback_logged = false;
     let mut xrun_logged = false;
+    let mut state = AssistantState::WakeWord;
     while !stopping.load(Ordering::Relaxed) {
         let first_samples = diagnostics.first_samples.load(Ordering::Relaxed);
         if !first_callback_logged && first_samples != usize::MAX {
@@ -143,6 +157,62 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if let Ok(error) = errors.try_recv() {
             return Err(format!("CPAL backend stream error ({:?}): {error}", error.kind()).into());
         }
+        if let AssistantState::Listening(recording) = &state
+            && recording.is_complete()
+        {
+            let AssistantState::Listening(recording) =
+                std::mem::replace(&mut state, AssistantState::WakeWord)
+            else {
+                unreachable!();
+            };
+            if let Some(audio) = recording.into_audio() {
+                speech.submit(audio)?;
+                state = AssistantState::Transcribing;
+                println!("[speech] Recognizing command...");
+            } else {
+                println!("[speech] No speech detected; listening for Hey Jarvis.");
+                reset_capture(
+                    &mut detector,
+                    &mut resampler,
+                    &receiver,
+                    &diagnostics,
+                    config.sample_rate,
+                )?;
+                filled = 0;
+            }
+        }
+        if matches!(state, AssistantState::Transcribing)
+            && let Some(result) = speech.try_result()?
+        {
+            // Discard audio during action execution/reset, as during the wake reply.
+            diagnostics.playback_active.store(true, Ordering::SeqCst);
+            if !stopping.load(Ordering::Relaxed) {
+                match result {
+                    Ok(text) if !text.is_empty() => {
+                        println!("[speech] Recognized: {text}");
+                        if let Some(command) = crate::commands::recognize(&text) {
+                            if let Err(error) = crate::actions::execute(command) {
+                                eprintln!("[actions] {error}");
+                            }
+                        } else {
+                            println!("[commands] Unknown command; no action taken.");
+                        }
+                    }
+                    Ok(_) => println!("[speech] No speech recognized; no action taken."),
+                    Err(error) => eprintln!("[speech] Cannot recognize command: {error}"),
+                }
+            }
+            reset_capture(
+                &mut detector,
+                &mut resampler,
+                &receiver,
+                &diagnostics,
+                config.sample_rate,
+            )?;
+            filled = 0;
+            state = AssistantState::WakeWord;
+            println!("Listening for Hey Jarvis.");
+        }
         let packet = match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(packet) => packet,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -150,8 +220,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 return Err("Microphone capture disconnected".into());
             }
         };
+        if matches!(state, AssistantState::Transcribing) {
+            // Continue draining CPAL's bounded queue while Whisper runs elsewhere.
+            continue;
+        }
         resampled.clear();
         resampler.process(&packet, &mut resampled);
+        if let AssistantState::Listening(recording) = &mut state {
+            recording.push(&resampled);
+            continue;
+        }
         for &sample in &resampled {
             if stopping.load(Ordering::Relaxed) {
                 break;
@@ -174,14 +252,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     last_detection = Some(frame_number);
                     diagnostics.playback_active.store(true, Ordering::SeqCst);
                     crate::voice::reply_or_warn(&stopping);
-                    // Keep capture muted while clearing every bit of stale
-                    // audio, including the remainder of this resampled packet.
-                    detector.reset()?;
-                    resampler = Resampler::new(config.sample_rate);
-                    while receiver.try_recv().is_ok() {}
+                    reset_capture(
+                        &mut detector,
+                        &mut resampler,
+                        &receiver,
+                        &diagnostics,
+                        config.sample_rate,
+                    )?;
                     filled = 0;
-                    diagnostics.capture_epoch.fetch_add(1, Ordering::SeqCst);
-                    diagnostics.playback_active.store(false, Ordering::SeqCst);
+                    state = AssistantState::Listening(CommandRecording::new());
+                    println!("Listening for a command (up to 8 seconds)...");
                     break;
                 }
                 filled = 0;
@@ -189,6 +269,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     drop(stream); // Stop callbacks before dropping queued audio and ONNX sessions.
+    Ok(())
+}
+
+fn reset_capture(
+    detector: &mut WakeWordDetector,
+    resampler: &mut Resampler,
+    receiver: &Receiver<Packet>,
+    diagnostics: &CaptureDiagnostics,
+    sample_rate: u32,
+) -> Result<(), Box<dyn Error>> {
+    // Clear every bit of stale audio while capture is muted. The callback epoch
+    // also discards partially assembled input packets before capture resumes.
+    diagnostics.playback_active.store(true, Ordering::SeqCst);
+    detector.reset()?;
+    *resampler = Resampler::new(sample_rate);
+    while receiver.try_recv().is_ok() {}
+    diagnostics.capture_epoch.fetch_add(1, Ordering::SeqCst);
+    diagnostics.playback_active.store(false, Ordering::SeqCst);
     Ok(())
 }
 
