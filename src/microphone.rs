@@ -191,16 +191,24 @@ pub fn run(recognizer: CommandRecognizer) -> Result<(), Box<dyn Error>> {
                 match result {
                     Ok(Transcription::Text(text)) => {
                         println!("[speech] Recognized: {text:?}");
+                        let matching_started = Instant::now();
                         let recognition = recognizer.recognize(&text);
+                        let matching_ms = matching_started.elapsed().as_secs_f64() * 1000.0;
                         let distance = recognition
                             .distance
                             .map_or_else(|| "n/a".to_owned(), |d| d.to_string());
                         println!(
-                            "[commands] Phrase: {text:?}; selected: {:?}; Levenshtein distance: {distance}",
+                            "[commands] Phrase: {text:?}; selected: {:?}; Levenshtein distance: {distance}; matching took {matching_ms:.3} ms",
                             recognition.command.map(|c| c.action.as_str())
                         );
                         if let Some(command) = recognition.command {
-                            if let Err(error) = crate::actions::execute(&command.action) {
+                            let action_started = Instant::now();
+                            let result = crate::actions::execute(&command.action);
+                            eprintln!(
+                                "[actions] Launch request took {} ms",
+                                action_started.elapsed().as_millis()
+                            );
+                            if let Err(error) = result {
                                 eprintln!("[actions] {error}");
                                 crate::voice::failure_or_warn(&stopping);
                             }

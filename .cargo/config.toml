@@ -1,0 +1,5 @@
+# whisper-rs-sys uses MSVC/CMake in this Windows project. Explicit Release
+# flags prevent cmake-rs from replacing CMake's optimized defaults with /MD only.
+[env]
+CMAKE_C_FLAGS_RELEASE = "/O2 /DNDEBUG"
+CMAKE_CXX_FLAGS_RELEASE = "/O2 /DNDEBUG"

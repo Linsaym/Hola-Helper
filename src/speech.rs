@@ -9,6 +9,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
@@ -60,7 +61,13 @@ impl SpeechWorker {
                     if signal.load(Ordering::Relaxed) {
                         break;
                     }
+                    let started = Instant::now();
                     let result = transcribe(&mut state, &audio, &signal).map_err(|e| e.to_string());
+                    eprintln!(
+                        "[speech] Recognition took {} ms ({} ms of audio)",
+                        started.elapsed().as_millis(),
+                        audio.len() * 1000 / crate::command_audio::SAMPLE_RATE
+                    );
                     if output.try_send(result).is_err() {
                         break;
                     }
@@ -159,6 +166,33 @@ unsafe extern "C" fn abort_when_stopping(data: *mut c_void) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "requires Base model; benchmarks HOLA_TEST_COMMAND_WAV or samples/heyjarvis.wav without executing actions"]
+    fn benchmark_command_recognition_latency() -> Result<(), Box<dyn Error>> {
+        let path = std::env::var_os("HOLA_TEST_COMMAND_WAV")
+            .unwrap_or_else(|| "samples/heyjarvis.wav".into());
+        let mut wav = crate::wav::open(Path::new(&path))?;
+        let audio: Vec<f32> = wav
+            .samples::<i16>()
+            .map(|s| s.map(|s| f32::from(s) / 32768.0))
+            .collect::<Result<_, _>>()?;
+        let worker = SpeechWorker::new(
+            Path::new("models/whisper/ggml-base.bin"),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        for attempt in 1..=4 {
+            let started = std::time::Instant::now();
+            worker.submit(audio.clone())?;
+            let result = worker.results.recv_timeout(Duration::from_secs(60))??;
+            eprintln!(
+                "[benchmark] attempt={attempt} audio_ms={} elapsed_ms={} result={result:?}",
+                audio.len() * 1000 / crate::command_audio::SAMPLE_RATE,
+                started.elapsed().as_millis()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn missing_model_returns_an_error_before_starting_worker() {
